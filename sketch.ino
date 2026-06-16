@@ -1,702 +1,699 @@
 /*
- * SIMULASI SISTEM KONTROL LIFT MULTI-LANTAI BERBASIS FreeRTOS
+ * SIMULASI SISTEM KONTROL LIFT BERBASIS FreeRTOS
  * Target: ESP32 dengan Wokwi Simulator
  * 
- * Fitur RTOS:
- * - 5 Tasks dengan priority-based scheduling
- * - Queue untuk floor request
- * - Mutex untuk shared state protection (priority inheritance)
- * - Binary Semaphore untuk ISR deferred processing
- * - ISR untuk emergency button
- * - Stack monitoring
- * - Fault-tolerant emergency handling
+ * Fitur:
+ * - 1 Lift dengan 5 lantai
+ * - Tombol lantai 1-5 di dalam lift
+ * - Tombol emergency
+ * - Tombol buka/tutup pintu manual
+ * - LCD1602 Display untuk status real-time
+ * - Priority-based scheduling
+ * - Elevator SCAN scheduling (direction-aware request handling)
+ * - Mutex, Semaphore untuk sinkronisasi
  */
 
 #include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
 
-// Pin Definitions
+// LCD I2C
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Pin Definitions - Lift Internal Buttons
 #define FLOOR_1_BTN     13
 #define FLOOR_2_BTN     12
 #define FLOOR_3_BTN     14
 #define FLOOR_4_BTN     27
 #define FLOOR_5_BTN     26
 #define EMERGENCY_BTN   25
-#define DOOR_OBSTACLE_BTN 33
+#define OPEN_DOOR_BTN   33
+#define CLOSE_DOOR_BTN  32
 
-#define LED_UP          19
-#define LED_DOWN        18
-#define LED_DOOR        5
-#define LED_EMERGENCY   17
+// LCD I2C Pins
+#define LCD_SDA 21
+#define LCD_SCL 22
 
 // Elevator States
 enum Direction { IDLE, MOVING_UP, MOVING_DOWN };
 enum DoorState { DOOR_CLOSED, DOOR_OPENING, DOOR_OPEN, DOOR_CLOSING };
 
-// Shared State Structure (Protected by mutex)
+// Lift State Structure
 typedef struct {
   int currentFloor;
   int targetFloor;
-  Direction direction;
+  Direction direction;       // current travel direction (IDLE/UP/DOWN)
   DoorState doorState;
   bool emergencyMode;
-  bool doorObstacle;
-} ElevatorState;
+  bool manualDoorOpen;
+  bool manualDoorClose;
+  bool needsDepartureDoor;   // true = door must open/close before moving to new floor
+  bool needsArrivalDoor;     // true = door must open/close after arriving at target floor
+  bool floorRequested[6];    // index 1-5, true if floor has pending request
+  int floorRequestOrder[6];  // request sequence number for tie-breaking
+  int requestCounter;        // increments with each new request
+} LiftState;
 
 // Global Variables
-ElevatorState elevatorState = {1, 1, IDLE, DOOR_CLOSED, false, false};
+LiftState lift = {
+  1, 1, IDLE, DOOR_CLOSED,         // currentFloor, targetFloor, direction, doorState
+  false, false, false,             // emergencyMode, manualDoorOpen, manualDoorClose
+  false, false,                    // needsDepartureDoor, needsArrivalDoor
+  {false, false, false, false, false, false},  // floorRequested[6]
+  {0, 0, 0, 0, 0, 0},              // floorRequestOrder[6]
+  0                                // requestCounter
+};
 
 // FreeRTOS Handles
-QueueHandle_t floorRequestQueue;
-SemaphoreHandle_t elevatorStateMutex;
+SemaphoreHandle_t liftStateMutex;
+SemaphoreHandle_t lcdMutex;
 SemaphoreHandle_t emergencySemaphore;
+
 TaskHandle_t emergencyTaskHandle;
-
-TaskHandle_t elevatorControlTaskHandle;
-TaskHandle_t doorControlTaskHandle;
+TaskHandle_t liftControlTaskHandle;
+TaskHandle_t doorTaskHandle;
 TaskHandle_t requestHandlerTaskHandle;
-TaskHandle_t displayLoggerTaskHandle;
-
-// ISR Variables
-volatile bool emergencyButtonPressed = false;
+TaskHandle_t lcdDisplayTaskHandle;
 
 /*
- * ISR untuk Emergency Button
- * Prinsip: ISR harus singkat dan cepat
- * - Tidak melakukan processing berat
- * - Hanya memberi semaphore untuk deferred processing
- * - EmergencyHandlerTask akan melakukan processing sesungguhnya
- */
-void IRAM_ATTR emergencyButtonISR() {
-  emergencyButtonPressed = true;
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  
-  // Gunakan FromISR variant untuk signal dari interrupt context
-  xSemaphoreGiveFromISR(emergencySemaphore, &xHigherPriorityTaskWoken);
-  
-  // Yield jika task prioritas lebih tinggi terbangun
-  if (xHigherPriorityTaskWoken) {
-    portYIELD_FROM_ISR();
-  }
-}
-
-/*
- * Emergency Handler Task - PRIORITAS TERTINGGI
+ * Emergency Handler Task
  * Priority: 4 (Highest)
- * Fungsi: Menangani kondisi emergency dengan deferred interrupt processing
- * 
- * Strategi:
- * - Wait pada binary semaphore dari ISR
- * - Ketika emergency aktif: stop lift, buka pintu, clear queue
- * - Gunakan mutex untuk update shared state dengan aman
  */
 void EmergencyHandlerTask(void *parameter) {
-  Serial.println("[TASK] EmergencyHandlerTask started - Priority: 4 (HIGHEST)");
+  Serial.println("[TASK] EmergencyHandlerTask started - Priority: 4");
   
   while (1) {
-    // Wait untuk semaphore dari ISR (blocking wait - OK untuk emergency task)
     if (xSemaphoreTake(emergencySemaphore, portMAX_DELAY) == pdTRUE) {
-      Serial.println("\n[EMERGENCY] *** EMERGENCY BUTTON PRESSED! ***");
+      Serial.println("\n[EMERGENCY] *** EMERGENCY ACTIVATED! ***");
       
-      // Acquire mutex dengan timeout untuk keamanan
-      if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        // Critical Section Start
-        elevatorState.emergencyMode = true;
-        elevatorState.direction = IDLE;
-        elevatorState.doorState = DOOR_OPEN;
-        // Critical Section End
-        xSemaphoreGive(elevatorStateMutex);
+      if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        lift.emergencyMode = true;
+        lift.direction = IDLE;
+        lift.doorState = DOOR_OPEN;
+        lift.needsDepartureDoor = false;
+        lift.needsArrivalDoor = false;
+        for (int f = 1; f <= 5; f++) {
+          lift.floorRequested[f] = false;
+          lift.floorRequestOrder[f] = 0;
+        }
+        lift.requestCounter = 0;
+        xSemaphoreGive(liftStateMutex);
         
-        // Clear semua request di queue
-        xQueueReset(floorRequestQueue);
+        Serial.println("[EMERGENCY] Lift stopped, door opened, requests cleared");
+        Serial.println("[EMERGENCY] Wait 5 seconds to reset...");
         
-        // Update LED
-        digitalWrite(LED_UP, LOW);
-        digitalWrite(LED_DOWN, LOW);
-        digitalWrite(LED_DOOR, HIGH);
-        digitalWrite(LED_EMERGENCY, HIGH);
-        
-        Serial.println("[EMERGENCY] Lift stopped, door opened, queue cleared");
-        Serial.println("[EMERGENCY] Press emergency button again to reset");
-        
-        // Wait untuk emergency reset (simulated dengan delay)
         vTaskDelay(pdMS_TO_TICKS(5000));
         
-        // Reset emergency mode
-        if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-          elevatorState.emergencyMode = false;
-          digitalWrite(LED_EMERGENCY, LOW);
-          xSemaphoreGive(elevatorStateMutex);
-          Serial.println("[EMERGENCY] Emergency mode cleared. System normal.\n");
-        }
-      } else {
-        Serial.println("[EMERGENCY] ERROR: Could not acquire mutex!");
+        xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100));
+        lift.emergencyMode = false;
+        xSemaphoreGive(liftStateMutex);
+        
+        Serial.println("[EMERGENCY] Emergency cleared. System normal.\n");
       }
     }
   }
 }
 
 /*
- * Elevator Control Task - PRIORITAS TINGGI
+ * Lift Control Task
  * Priority: 3
- * Fungsi: Mengontrol pergerakan lift dari lantai ke lantai
  * 
- * Alur:
- * - Ambil request dari queue
- * - Tentukan arah (UP/DOWN)
- * - Simulasi pergerakan dengan delay periodik
- * - Update current floor
- * - Berhenti saat mencapai target floor
+ * Elevator (SCAN) scheduling:
+ * - Service all pending floors in the current travel direction first,
+ *   in ascending/descending order along the way.
+ * - Only reverse direction after the last request in the current direction.
+ * - When idle, pick the nearest requested floor (FIFO tie-break).
  */
-void ElevatorControlTask(void *parameter) {
-  Serial.println("[TASK] ElevatorControlTask started - Priority: 3 (HIGH)");
+void LiftControlTask(void *parameter) {
+  Serial.println("[TASK] LiftControlTask started - Priority: 3");
   TickType_t xLastWakeTime = xTaskGetTickCount();
   
-  Serial.println("[ELEVATOR] Ready to receive floor requests from queue");
+  auto hasAnyRequest = []() -> bool {
+    for (int f = 1; f <= 5; f++) {
+      if (lift.floorRequested[f]) return true;
+    }
+    return false;
+  };
+  
+  auto nearestRequestedFloor = [](int currentFloor) -> int {
+    int bestFloor = -1;
+    int minDist = 999;
+    int bestOrder = 999999;
+    for (int f = 1; f <= 5; f++) {
+      if (lift.floorRequested[f]) {
+        int dist = abs(f - currentFloor);
+        int order = lift.floorRequestOrder[f];
+        if (dist < minDist || (dist == minDist && order < bestOrder)) {
+          minDist = dist;
+          bestFloor = f;
+          bestOrder = order;
+        }
+      }
+    }
+    return bestFloor;
+  };
+  
+  auto nextRequestAbove = [](int floor) -> int {
+    for (int f = floor + 1; f <= 5; f++) {
+      if (lift.floorRequested[f]) return f;
+    }
+    return -1;
+  };
+  
+  auto nextRequestBelow = [](int floor) -> int {
+    for (int f = floor - 1; f >= 1; f--) {
+      if (lift.floorRequested[f]) return f;
+    }
+    return -1;
+  };
+  
+  auto clearRequest = [](int floor) {
+    lift.floorRequested[floor] = false;
+    lift.floorRequestOrder[floor] = 0;
+  };
   
   while (1) {
-    int requestedFloor;
+    // Snapshot state under mutex
+    int current, target;
+    Direction dir;
+    DoorState door;
+    bool needDep, needArr, emergency;
     
-    // Check apakah ada request di queue (non-blocking check)
-    if (xQueueReceive(floorRequestQueue, &requestedFloor, 0) == pdTRUE) {
-      Serial.printf("[ELEVATOR] *** New request received from queue: Floor %d ***\n", requestedFloor);
-      
-      // Acquire mutex untuk update target floor
-      if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        elevatorState.targetFloor = requestedFloor;
-        Serial.printf("[ELEVATOR] Target floor updated to: %d\n", requestedFloor);
-        xSemaphoreGive(elevatorStateMutex);
-      }
+    if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      current = lift.currentFloor;
+      target = lift.targetFloor;
+      dir = lift.direction;
+      door = lift.doorState;
+      needDep = lift.needsDepartureDoor;
+      needArr = lift.needsArrivalDoor;
+      emergency = lift.emergencyMode;
+      xSemaphoreGive(liftStateMutex);
+    } else {
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
+      continue;
     }
     
-    // Main elevator control logic
-    if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      // Simpan state lokal untuk meminimalkan critical section
-      int current = elevatorState.currentFloor;
-      int target = elevatorState.targetFloor;
-      bool emergency = elevatorState.emergencyMode;
-      DoorState door = elevatorState.doorState;
-      
-      xSemaphoreGive(elevatorStateMutex);  // Release mutex secepat mungkin
-      
-      // Jangan gerakkan lift jika emergency atau pintu belum tertutup
-      if (emergency) {
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
-        continue;
-      }
-      
-      if (door != DOOR_CLOSED) {
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
-        continue;
-      }
-      
-      // Tentukan arah dan gerakkan lift
-      if (current < target) {
-        // Naik
-        if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-          elevatorState.direction = MOVING_UP;
-          elevatorState.currentFloor++;
-          xSemaphoreGive(elevatorStateMutex);
-        }
+    // Safety: don't move during emergency or while door is busy
+    if (emergency || door != DOOR_CLOSED || needDep || needArr) {
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
+      continue;
+    }
+    
+    if (dir == IDLE) {
+      // Lift is idle: choose nearest request
+      if (hasAnyRequest()) {
+        int newTarget = nearestRequestedFloor(current);
         
-        digitalWrite(LED_UP, HIGH);
-        digitalWrite(LED_DOWN, LOW);
-        Serial.printf("[ELEVATOR] Moving UP: Floor %d -> %d\n", current, current + 1);
-        
-      } else if (current > target) {
-        // Turun
-        if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-          elevatorState.direction = MOVING_DOWN;
-          elevatorState.currentFloor--;
-          xSemaphoreGive(elevatorStateMutex);
-        }
-        
-        digitalWrite(LED_UP, LOW);
-        digitalWrite(LED_DOWN, HIGH);
-        Serial.printf("[ELEVATOR] Moving DOWN: Floor %d -> %d\n", current, current - 1);
-        
-      } else {
-        // Sudah di target floor
-        if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-          // Only log arrival if we were moving before
-          if (elevatorState.direction != IDLE) {
-            Serial.printf("[ELEVATOR] Arrived at Floor %d\n", current);
+        if (newTarget == current) {
+          // Request is for the current floor: just open the arrival door
+          if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            lift.needsArrivalDoor = true;
+            clearRequest(current);
+            xSemaphoreGive(liftStateMutex);
           }
-          elevatorState.direction = IDLE;
-          xSemaphoreGive(elevatorStateMutex);
+          Serial.printf("[LIFT] Arrived at Floor %d\n", current);
+        } else {
+          Direction newDir = (newTarget > current) ? MOVING_UP : MOVING_DOWN;
+          
+          if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            lift.targetFloor = newTarget;
+            lift.direction = newDir;
+            lift.needsDepartureDoor = true;
+            xSemaphoreGive(liftStateMutex);
+          }
+          Serial.printf("[LIFT] New request: Floor %d\n", newTarget);
         }
+      }
+    } else {
+      // Currently traveling
+      if (lift.floorRequested[current]) {
+        // Stop at this requested floor for arrival door
+        if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          lift.targetFloor = current;
+          lift.needsArrivalDoor = true;
+          clearRequest(current);
+          xSemaphoreGive(liftStateMutex);
+        }
+        Serial.printf("[LIFT] Arrived at Floor %d\n", current);
+      } else {
+        // No stop needed here: target the nearest request in current direction
+        int newTarget = (dir == MOVING_UP) ? nextRequestAbove(current) : nextRequestBelow(current);
         
-        digitalWrite(LED_UP, LOW);
-        digitalWrite(LED_DOWN, LOW);
+        if (newTarget == -1) {
+          // No more requests in current direction: reverse or idle
+          int reverseTarget = (dir == MOVING_UP) ? nextRequestBelow(current) : nextRequestAbove(current);
+          if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (reverseTarget != -1) {
+              lift.targetFloor = reverseTarget;
+              lift.direction = (dir == MOVING_UP) ? MOVING_DOWN : MOVING_UP;
+            } else {
+              lift.direction = IDLE;
+              lift.targetFloor = current;
+            }
+            xSemaphoreGive(liftStateMutex);
+          }
+        } else {
+          if (newTarget != target) {
+            if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+              lift.targetFloor = newTarget;
+              xSemaphoreGive(liftStateMutex);
+            }
+            target = newTarget;
+          }
+          
+          // Continue moving toward target
+          if (current < target) {
+            if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+              lift.currentFloor++;
+              xSemaphoreGive(liftStateMutex);
+            }
+            Serial.printf("[LIFT] Moving UP: Floor %d -> %d\n", current, current + 1);
+          } else if (current > target) {
+            if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+              lift.currentFloor--;
+              xSemaphoreGive(liftStateMutex);
+            }
+            Serial.printf("[LIFT] Moving DOWN: Floor %d -> %d\n", current, current - 1);
+          }
+        }
       }
     }
     
-    // Delay periodik untuk simulasi pergerakan (1 detik per lantai)
     vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
   }
 }
 
 /*
- * Door Control Task - PRIORITAS SEDANG
+ * Door Control Task
  * Priority: 2
- * Fungsi: Mengontrol pembukaan dan penutupan pintu
  * 
- * Alur:
- * - Cek apakah lift sudah sampai di target floor
- * - Buka pintu (simulasi dengan delay)
- * - Tunggu beberapa detik
- * - Cek door obstacle sensor
- * - Tutup pintu jika aman
+ * Handles two door scenarios:
+ * 1. Departure door: opens/closes door BEFORE lift moves to a new floor
+ * 2. Arrival door:   opens/closes door AFTER lift arrives at target floor
  */
 void DoorControlTask(void *parameter) {
-  Serial.println("[TASK] DoorControlTask started - Priority: 2 (MEDIUM)");
+  Serial.println("[TASK] DoorControlTask started - Priority: 2");
   TickType_t xLastWakeTime = xTaskGetTickCount();
-  bool doorProcessed = false;  // Flag to track if door already processed for current floor
+  bool doorProcessed = true;  // true to prevent door opening on startup without a request
   
   while (1) {
     bool shouldOpenDoor = false;
-    bool obstacleDetected = digitalRead(DOOR_OBSTACLE_BTN) == LOW;
+    bool manualOpen = false, manualClose = false;
+    bool wasDepartureDoor = false;
+    bool wasArrivalDoor = false;
     
-    // Update door obstacle state
-    if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      elevatorState.doorObstacle = obstacleDetected;
+    if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      manualOpen = lift.manualDoorOpen;
+      manualClose = lift.manualDoorClose;
+      lift.manualDoorOpen = false;
+      lift.manualDoorClose = false;
       
-      // Buka pintu hanya jika:
-      // 1. Lift idle dan di target floor
-      // 2. Pintu tertutup
-      // 3. Tidak emergency
-      // 4. Lift baru saja tiba (direction berubah dari MOVING ke IDLE)
-      if (elevatorState.direction == IDLE && 
-          elevatorState.currentFloor == elevatorState.targetFloor &&
-          elevatorState.doorState == DOOR_CLOSED &&
-          !elevatorState.emergencyMode &&
-          !doorProcessed) {
+      // Departure door: new request received, open door before moving
+      if (lift.needsDepartureDoor &&
+          lift.doorState == DOOR_CLOSED &&
+          !lift.emergencyMode) {
+        shouldOpenDoor = true;
+        wasDepartureDoor = true;
+      }
+      // Arrival door: lift arrived at target floor
+      else if (lift.needsArrivalDoor &&
+               lift.doorState == DOOR_CLOSED &&
+               !lift.emergencyMode) {
+        shouldOpenDoor = true;
+        wasArrivalDoor = true;
+      }
+      // Manual open override
+      else if (manualOpen && lift.doorState == DOOR_CLOSED) {
         shouldOpenDoor = true;
       }
       
-      // Reset flag jika lift mulai bergerak
-      if (elevatorState.direction != IDLE) {
+      // Reset doorProcessed when lift starts moving (direction changes from IDLE)
+      if (lift.direction != IDLE) {
         doorProcessed = false;
       }
       
-      xSemaphoreGive(elevatorStateMutex);
+      xSemaphoreGive(liftStateMutex);
+    }
+    
+    // Manual close door
+    if (manualClose) {
+      if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (lift.doorState == DOOR_OPEN) {
+          Serial.println("[DOOR] Manual close triggered");
+          lift.doorState = DOOR_CLOSING;
+          xSemaphoreGive(liftStateMutex);
+          
+          vTaskDelay(pdMS_TO_TICKS(500));
+          
+          xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100));
+          lift.doorState = DOOR_CLOSED;
+          xSemaphoreGive(liftStateMutex);
+          
+          Serial.println("[DOOR] Closed manually");
+          doorProcessed = true;
+        } else {
+          xSemaphoreGive(liftStateMutex);
+        }
+      }
     }
     
     if (shouldOpenDoor) {
-      // Proses buka pintu
-      Serial.println("[DOOR] Opening door...");
-      if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        elevatorState.doorState = DOOR_OPENING;
-        xSemaphoreGive(elevatorStateMutex);
+      if (wasDepartureDoor) {
+        Serial.println("[DOOR] Opening (departure)...");
+      } else if (wasArrivalDoor) {
+        Serial.println("[DOOR] Opening (arrival)...");
+      } else {
+        Serial.println("[DOOR] Opening...");
       }
       
-      vTaskDelay(pdMS_TO_TICKS(500));  // Simulasi waktu buka pintu
-      
-      if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        elevatorState.doorState = DOOR_OPEN;
-        xSemaphoreGive(elevatorStateMutex);
+      if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        lift.doorState = DOOR_OPENING;
+        if (wasDepartureDoor) {
+          lift.needsDepartureDoor = false;  // clear departure flag
+        }
+        if (wasArrivalDoor) {
+          lift.needsArrivalDoor = false;    // clear arrival flag
+        }
+        xSemaphoreGive(liftStateMutex);
       }
-      digitalWrite(LED_DOOR, HIGH);
-      Serial.println("[DOOR] Door opened");
       
-      // Tunggu penumpang keluar/masuk
+      vTaskDelay(pdMS_TO_TICKS(500));
+      
+      if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        lift.doorState = DOOR_OPEN;
+        xSemaphoreGive(liftStateMutex);
+      }
+      Serial.println("[DOOR] Opened");
+      
       vTaskDelay(pdMS_TO_TICKS(3000));
       
-      // Cek obstacle sebelum tutup pintu
-      bool canCloseDoor = false;
-      while (!canCloseDoor) {
-        obstacleDetected = digitalRead(DOOR_OBSTACLE_BTN) == LOW;
-        
-        if (obstacleDetected) {
-          Serial.println("[DOOR] Obstacle detected! Cannot close door. Reopening...");
-          vTaskDelay(pdMS_TO_TICKS(2000));
-        } else {
-          canCloseDoor = true;  // Aman untuk tutup
-        }
+      Serial.println("[DOOR] Closing...");
+      if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        lift.doorState = DOOR_CLOSING;
+        xSemaphoreGive(liftStateMutex);
       }
       
-      // Proses tutup pintu
-      Serial.println("[DOOR] Closing door...");
-      if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        elevatorState.doorState = DOOR_CLOSING;
-        xSemaphoreGive(elevatorStateMutex);
+      vTaskDelay(pdMS_TO_TICKS(500));
+      
+      if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        lift.doorState = DOOR_CLOSED;
+        xSemaphoreGive(liftStateMutex);
       }
+      Serial.println("[DOOR] Closed\n");
       
-      vTaskDelay(pdMS_TO_TICKS(500));  // Simulasi waktu tutup pintu
-      
-      if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        elevatorState.doorState = DOOR_CLOSED;
-        xSemaphoreGive(elevatorStateMutex);
-      }
-      digitalWrite(LED_DOOR, LOW);
-      Serial.println("[DOOR] Door closed\n");
-      
-      // Set flag bahwa door sudah diproses untuk floor ini
       doorProcessed = true;
     }
     
-    // Delay periodik
     vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
   }
 }
 
 /*
- * Request Handler Task - PRIORITAS SEDANG-RENDAH
+ * Request Handler Task
  * Priority: 1
- * Fungsi: Menerima request lantai dari Serial Monitor atau Button
- * 
- * INPUT METHODS:
- * 1. Serial Monitor: Ketik angka 1-5 untuk request floor
- * 2. Button: (jika wiring benar di Wokwi)
- * 
- * Commands:
- * - Type '1' to '5' = Request floor 1-5
- * - Type 'e' = Emergency stop
- * - Type 'o' = Toggle obstacle
  */
 void RequestHandlerTask(void *parameter) {
-  Serial.println("[TASK] RequestHandlerTask started - Priority: 1 (MEDIUM-LOW)");
+  Serial.println("[TASK] RequestHandlerTask started - Priority: 1");
   TickType_t xLastWakeTime = xTaskGetTickCount();
   
-  // Array untuk debouncing button
-  bool lastButtonState[5];
-  unsigned long lastPressTime[5] = {0, 0, 0, 0, 0};
-  const unsigned long debounceDelay = 300;
+  // Button pins arrays
+  int floorButtons[5] = {FLOOR_1_BTN, FLOOR_2_BTN, FLOOR_3_BTN, FLOOR_4_BTN, FLOOR_5_BTN};
+  int doorOpenBtn = OPEN_DOOR_BTN;
+  int doorCloseBtn = CLOSE_DOOR_BTN;
+  int emergencyBtn = EMERGENCY_BTN;
   
-  int buttonPins[5] = {FLOOR_1_BTN, FLOOR_2_BTN, FLOOR_3_BTN, FLOOR_4_BTN, FLOOR_5_BTN};
+  bool lastFloorState[5];
+  bool lastOpenState, lastCloseState, lastEmergencyState;
+  unsigned long lastFloorPress[5] = {0};
+  unsigned long lastOpenPress = 0, lastClosePress = 0, lastEmergencyPress = 0;
+  const unsigned long debounce = 100;  // reduced for Wokwi simulation responsiveness
   
-  // Initialize button states
   for (int i = 0; i < 5; i++) {
-    lastButtonState[i] = digitalRead(buttonPins[i]);
+    lastFloorState[i] = digitalRead(floorButtons[i]);
+    Serial.printf("[BTN-DBG] Floor %d button (GPIO %d) initial: %s\n", 
+                  i+1, floorButtons[i], lastFloorState[i] ? "HIGH" : "LOW");
   }
+  lastOpenState = digitalRead(doorOpenBtn);
+  lastCloseState = digitalRead(doorCloseBtn);
+  lastEmergencyState = digitalRead(emergencyBtn);
   
-  Serial.println("\n╔════════════════════════════════════════╗");
-  Serial.println("║  ELEVATOR READY - TWO INPUT MODES:   ║");
-  Serial.println("╠════════════════════════════════════════╣");
-  Serial.println("║  1. SERIAL INPUT (Recommended)        ║");
-  Serial.println("║     Type '1' to '5' → Request floor   ║");
-  Serial.println("║     Type 'e' → Emergency stop         ║");
-  Serial.println("║     Type 'o' → Toggle obstacle        ║");
-  Serial.println("║                                        ║");
-  Serial.println("║  2. BUTTON INPUT (if wired correctly) ║");
-  Serial.println("║     Click buttons in Wokwi diagram    ║");
-  Serial.println("╚════════════════════════════════════════╝\n");
-  
-  int pollCount = 0;
+  Serial.println("\n╔═══════════════════════════════════════════════╗");
+  Serial.println("║  LIFT SYSTEM READY                           ║");
+  Serial.println("║  Use buttons to control the lift             ║");
+  Serial.println("╚═══════════════════════════════════════════════╝\n");
   
   while (1) {
     unsigned long currentTime = millis();
     
-    // === METHOD 1: SERIAL INPUT (ALWAYS WORKS) ===
-    if (Serial.available() > 0) {
-      char input = Serial.read();
+    // === FLOOR BUTTONS ===
+    for (int i = 0; i < 5; i++) {
+      bool state = digitalRead(floorButtons[i]);
       
-      // Floor request (1-5)
-      if (input >= '1' && input <= '5') {
-        int requestedFloor = input - '0';
-        
-        Serial.printf("\n[SERIAL INPUT] Floor %d requested\n", requestedFloor);
-        
-        if (xQueueSend(floorRequestQueue, &requestedFloor, pdMS_TO_TICKS(100)) == pdTRUE) {
-          Serial.printf("[REQUEST] Floor %d added to queue successfully ✓\n\n", requestedFloor);
-        } else {
-          Serial.printf("[REQUEST] ERROR: Queue full! ✗\n\n");
-        }
+      if (state != lastFloorState[i]) {
+        Serial.printf("[BTN-DBG] Floor %d: %s -> %s\n", i+1,
+                      lastFloorState[i] ? "HIGH" : "LOW",
+                      state ? "HIGH" : "LOW");
       }
-      // Emergency command
-      else if (input == 'e' || input == 'E') {
-        Serial.println("\n[SERIAL INPUT] Emergency triggered!");
-        xSemaphoreGive(emergencySemaphore);
-      }
-      // Obstacle toggle
-      else if (input == 'o' || input == 'O') {
-        Serial.println("\n[SERIAL INPUT] Obstacle toggled (not implemented in serial mode)\n");
-      }
-    }
-    
-    // === METHOD 2: BUTTON INPUT (May not work if wiring issue) ===
-    // Debug: Print button states periodically
-    pollCount++;
-    if (pollCount >= 100) {
-      Serial.print("[BUTTON DEBUG] States: ");
-      for (int i = 0; i < 5; i++) {
-        Serial.printf("F%d=%s ", i+1, digitalRead(buttonPins[i]) == HIGH ? "H" : "L");
-      }
-      Serial.println("(H=Released, L=Pressed)");
-      pollCount = 0;
-    }
-    
-    // Check emergency mode
-    bool emergency = false;
-    if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-      emergency = elevatorState.emergencyMode;
-      xSemaphoreGive(elevatorStateMutex);
-    }
-    
-    if (!emergency) {
-      // Read button states
-      for (int i = 0; i < 5; i++) {
-        bool currentState = digitalRead(buttonPins[i]);
-        
-        // Detect button press (HIGH->LOW transition)
-        if (currentState == LOW && lastButtonState[i] == HIGH) {
-          if ((currentTime - lastPressTime[i]) > debounceDelay) {
-            int requestedFloor = i + 1;
-            
-            Serial.printf("\n[BUTTON INPUT] Floor %d button pressed (GPIO %d)\n", requestedFloor, buttonPins[i]);
-            
-            if (xQueueSend(floorRequestQueue, &requestedFloor, pdMS_TO_TICKS(100)) == pdTRUE) {
-              Serial.printf("[REQUEST] Floor %d added to queue successfully ✓\n\n", requestedFloor);
-            } else {
-              Serial.printf("[REQUEST] ERROR: Queue full! ✗\n\n");
+      
+      if (state == LOW && lastFloorState[i] == HIGH) {
+        if ((currentTime - lastFloorPress[i]) > debounce) {
+          int floor = i + 1;
+          
+          if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            if (!lift.floorRequested[floor]) {
+              lift.floorRequested[floor] = true;
+              lift.floorRequestOrder[floor] = ++lift.requestCounter;
             }
-            
-            lastPressTime[i] = currentTime;
+            xSemaphoreGive(liftStateMutex);
           }
+          
+          Serial.printf("\n[BUTTON] Floor %d pressed\n", floor);
+          lastFloorPress[i] = currentTime;
         }
-        
-        lastButtonState[i] = currentState;
       }
+      lastFloorState[i] = state;
     }
     
-    // Delay periodik
+    // === OPEN DOOR BUTTON ===
+    {
+      bool state = digitalRead(doorOpenBtn);
+      if (state != lastOpenState) {
+        Serial.printf("[BTN-DBG] Open: %s -> %s\n",
+                      lastOpenState ? "HIGH" : "LOW",
+                      state ? "HIGH" : "LOW");
+      }
+      if (state == LOW && lastOpenState == HIGH) {
+        if ((currentTime - lastOpenPress) > debounce) {
+          Serial.println("\n[BUTTON] Manual door open");
+          if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            lift.manualDoorOpen = true;
+            xSemaphoreGive(liftStateMutex);
+          }
+          lastOpenPress = currentTime;
+        }
+      }
+      lastOpenState = state;
+    }
+    
+    // === CLOSE DOOR BUTTON ===
+    {
+      bool state = digitalRead(doorCloseBtn);
+      if (state != lastCloseState) {
+        Serial.printf("[BTN-DBG] Close: %s -> %s\n",
+                      lastCloseState ? "HIGH" : "LOW",
+                      state ? "HIGH" : "LOW");
+      }
+      if (state == LOW && lastCloseState == HIGH) {
+        if ((currentTime - lastClosePress) > debounce) {
+          Serial.println("\n[BUTTON] Manual door close");
+          if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            lift.manualDoorClose = true;
+            xSemaphoreGive(liftStateMutex);
+          }
+          lastClosePress = currentTime;
+        }
+      }
+      lastCloseState = state;
+    }
+    
+    // === EMERGENCY BUTTON ===
+    {
+      bool state = digitalRead(emergencyBtn);
+      if (state != lastEmergencyState) {
+        Serial.printf("[BTN-DBG] Emergency: %s -> %s\n",
+                      lastEmergencyState ? "HIGH" : "LOW",
+                      state ? "HIGH" : "LOW");
+      }
+      if (state == LOW && lastEmergencyState == HIGH) {
+        if ((currentTime - lastEmergencyPress) > debounce) {
+          Serial.println("\n[BUTTON] Emergency triggered!");
+          xSemaphoreGive(emergencySemaphore);
+          lastEmergencyPress = currentTime;
+        }
+      }
+      lastEmergencyState = state;
+    }
+    
     vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(50));
   }
 }
 
 /*
- * Display Logger Task - PRIORITAS RENDAH
+ * LCD Display Task
  * Priority: 0 (Lowest)
- * Fungsi: Menampilkan status sistem secara periodik dan monitoring stack
  * 
- * Output:
- * - Current floor, target floor, direction
- * - Door state
- * - Emergency mode
- * - Queue status
- * - Stack high water mark setiap task
+ * Format LCD 16x2:
+ * Line 1: Floor & Direction
+ * Line 2: Door & Queue Status
  */
-void DisplayLoggerTask(void *parameter) {
-  Serial.println("[TASK] DisplayLoggerTask started - Priority: 0 (LOWEST)");
+void LCDDisplayTask(void *parameter) {
+  Serial.println("[TASK] LCDDisplayTask started - Priority: 0");
   TickType_t xLastWakeTime = xTaskGetTickCount();
   
   while (1) {
-    // Tunggu 5 detik antara log
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(5000));
-    
-    Serial.println("\n========== SYSTEM STATUS ==========");
-    
-    // Baca elevator state
-    if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      Serial.printf("Current Floor: %d\n", elevatorState.currentFloor);
-      Serial.printf("Target Floor: %d\n", elevatorState.targetFloor);
+    if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      char line1[17] = {0};
+      char line2[17] = {0};
       
-      Serial.print("Direction: ");
-      switch(elevatorState.direction) {
-        case IDLE: Serial.println("IDLE"); break;
-        case MOVING_UP: Serial.println("MOVING UP"); break;
-        case MOVING_DOWN: Serial.println("MOVING DOWN"); break;
+      // Read Lift State
+      int curr = 1, targ = 1;
+      char door = 'C';
+      char emg = ' ';
+      const char* dirStr = "IDLE";
+      int queueCount = 0;
+      
+      if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        curr = lift.currentFloor;
+        targ = lift.targetFloor;
+        
+        // Direction as full word
+        if (lift.emergencyMode) {
+          emg = '!';
+        } else if (lift.direction == MOVING_UP) {
+          dirStr = "UP";
+        } else if (lift.direction == MOVING_DOWN) {
+          dirStr = "DOWN";
+        } else {
+          dirStr = "IDLE";
+        }
+        
+        // Door
+        if (lift.doorState == DOOR_OPEN) door = 'O';
+        else if (lift.doorState == DOOR_OPENING) door = 'o';
+        else if (lift.doorState == DOOR_CLOSING) door = 'c';
+        else door = 'C';
+        
+        // Count pending requests
+        queueCount = 0;
+        for (int f = 1; f <= 5; f++) {
+          if (lift.floorRequested[f]) queueCount++;
+        }
+        
+        xSemaphoreGive(liftStateMutex);
       }
       
-      Serial.print("Door State: ");
-      switch(elevatorState.doorState) {
-        case DOOR_CLOSED: Serial.println("CLOSED"); break;
-        case DOOR_OPENING: Serial.println("OPENING"); break;
-        case DOOR_OPEN: Serial.println("OPEN"); break;
-        case DOOR_CLOSING: Serial.println("CLOSING"); break;
+      // Format Line 1: Floor: 1>3 UP
+      if (emg == '!') {
+        snprintf(line1, 17, "Floor:%d>%d EMRG!", curr, targ);
+      } else {
+        snprintf(line1, 17, "Floor:%d>%d %s", curr, targ, dirStr);
       }
       
-      Serial.printf("Emergency Mode: %s\n", elevatorState.emergencyMode ? "ACTIVE" : "Normal");
-      Serial.printf("Door Obstacle: %s\n", elevatorState.doorObstacle ? "DETECTED" : "Clear");
+      // Format Line 2: Door:O  Req:2
+      snprintf(line2, 17, "Door:%c  Req:%d   ", door, queueCount);
       
-      xSemaphoreGive(elevatorStateMutex);
+      // Update LCD
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(line1);
+      lcd.setCursor(0, 1);
+      lcd.print(line2);
+      
+      xSemaphoreGive(lcdMutex);
     }
     
-    // Queue status
-    UBaseType_t queueWaiting = uxQueueMessagesWaiting(floorRequestQueue);
-    UBaseType_t queueAvailable = uxQueueSpacesAvailable(floorRequestQueue);
-    Serial.printf("Queue Status: %d requests waiting, %d spaces available\n", queueWaiting, queueAvailable);
-    
-    // Stack monitoring - High Water Mark (minimum free stack space)
-    Serial.println("\n--- Stack Monitoring (High Water Mark) ---");
-    if (emergencyTaskHandle != NULL) {
-      UBaseType_t hwm = uxTaskGetStackHighWaterMark(emergencyTaskHandle);
-      Serial.printf("EmergencyHandlerTask: %u words remaining\n", hwm);
-    }
-    if (elevatorControlTaskHandle != NULL) {
-      UBaseType_t hwm = uxTaskGetStackHighWaterMark(elevatorControlTaskHandle);
-      Serial.printf("ElevatorControlTask: %u words remaining\n", hwm);
-    }
-    if (doorControlTaskHandle != NULL) {
-      UBaseType_t hwm = uxTaskGetStackHighWaterMark(doorControlTaskHandle);
-      Serial.printf("DoorControlTask: %u words remaining\n", hwm);
-    }
-    if (requestHandlerTaskHandle != NULL) {
-      UBaseType_t hwm = uxTaskGetStackHighWaterMark(requestHandlerTaskHandle);
-      Serial.printf("RequestHandlerTask: %u words remaining\n", hwm);
-    }
-    if (displayLoggerTaskHandle != NULL) {
-      UBaseType_t hwm = uxTaskGetStackHighWaterMark(displayLoggerTaskHandle);
-      Serial.printf("DisplayLoggerTask: %u words remaining\n", hwm);
-    }
-    
-    // Heap memory
-    Serial.printf("Free Heap: %u bytes\n", esp_get_free_heap_size());
-    
-    Serial.println("===================================\n");
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
   }
 }
+
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
   Serial.println("\n\n");
-  Serial.println("=====================================");
-  Serial.println("  ELEVATOR CONTROL SYSTEM - FreeRTOS");
-  Serial.println("  5-Floor Simulation with Wokwi");
-  Serial.println("=====================================\n");
+  Serial.println("╔═══════════════════════════════════════════════╗");
+  Serial.println("║    LIFT CONTROL SYSTEM - FreeRTOS             ║");
+  Serial.println("║    1 Lift × 5 Floors with LCD Display        ║");
+  Serial.println("╚═══════════════════════════════════════════════╝\n");
   
-  // Initialize Pins
-  // Input buttons dengan pull-up internal
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("LIFT SYSTEM");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  delay(2000);
+  
+  Serial.println("[INIT] LCD initialized");
+  
+  // Initialize GPIO - Internal Buttons
   pinMode(FLOOR_1_BTN, INPUT_PULLUP);
   pinMode(FLOOR_2_BTN, INPUT_PULLUP);
   pinMode(FLOOR_3_BTN, INPUT_PULLUP);
   pinMode(FLOOR_4_BTN, INPUT_PULLUP);
   pinMode(FLOOR_5_BTN, INPUT_PULLUP);
   pinMode(EMERGENCY_BTN, INPUT_PULLUP);
-  pinMode(DOOR_OBSTACLE_BTN, INPUT_PULLUP);
-  
-  // Output LEDs
-  pinMode(LED_UP, OUTPUT);
-  pinMode(LED_DOWN, OUTPUT);
-  pinMode(LED_DOOR, OUTPUT);
-  pinMode(LED_EMERGENCY, OUTPUT);
-  
-  // Initial state
-  digitalWrite(LED_UP, LOW);
-  digitalWrite(LED_DOWN, LOW);
-  digitalWrite(LED_DOOR, LOW);
-  digitalWrite(LED_EMERGENCY, LOW);
+  pinMode(OPEN_DOOR_BTN, INPUT_PULLUP);
+  pinMode(CLOSE_DOOR_BTN, INPUT_PULLUP);
   
   Serial.println("[INIT] GPIO initialized");
   
-  // Debug: Test button states
-  delay(100);
-  Serial.println("[DEBUG] Initial button states (HIGH=released, LOW=pressed):");
-  Serial.printf("  Floor 1 (GPIO %d): %s\n", FLOOR_1_BTN, digitalRead(FLOOR_1_BTN) ? "HIGH" : "LOW");
-  Serial.printf("  Floor 2 (GPIO %d): %s\n", FLOOR_2_BTN, digitalRead(FLOOR_2_BTN) ? "HIGH" : "LOW");
-  Serial.printf("  Floor 3 (GPIO %d): %s\n", FLOOR_3_BTN, digitalRead(FLOOR_3_BTN) ? "HIGH" : "LOW");
-  Serial.printf("  Floor 4 (GPIO %d): %s\n", FLOOR_4_BTN, digitalRead(FLOOR_4_BTN) ? "HIGH" : "LOW");
-  Serial.printf("  Floor 5 (GPIO %d): %s\n", FLOOR_5_BTN, digitalRead(FLOOR_5_BTN) ? "HIGH" : "LOW");
-  Serial.printf("  Emergency (GPIO %d): %s\n", EMERGENCY_BTN, digitalRead(EMERGENCY_BTN) ? "HIGH" : "LOW");
-  Serial.printf("  Obstacle (GPIO %d): %s\n", DOOR_OBSTACLE_BTN, digitalRead(DOOR_OBSTACLE_BTN) ? "HIGH" : "LOW");
+  // Create Mutexes
+  liftStateMutex = xSemaphoreCreateMutex();
+  lcdMutex = xSemaphoreCreateMutex();
   
-  // Create Queue
-  // Queue untuk menyimpan floor request (max 10 request)
-  floorRequestQueue = xQueueCreate(10, sizeof(int));
-  if (floorRequestQueue == NULL) {
-    Serial.println("[ERROR] Failed to create queue!");
+  if (!liftStateMutex || !lcdMutex) {
+    Serial.println("[ERROR] Failed to create mutexes!");
     while(1);
   }
-  Serial.println("[INIT] Floor request queue created (size: 10)");
-  
-  // Create Mutex
-  // Mutex dengan priority inheritance untuk mencegah priority inversion
-  // Priority inheritance: jika task prioritas rendah hold mutex yang dibutuhkan
-  // task prioritas tinggi, maka task prioritas rendah akan temporary dinaikkan
-  // prioritasnya agar cepat selesai dan release mutex
-  elevatorStateMutex = xSemaphoreCreateMutex();
-  if (elevatorStateMutex == NULL) {
-    Serial.println("[ERROR] Failed to create mutex!");
-    while(1);
-  }
-  Serial.println("[INIT] Elevator state mutex created (with priority inheritance)");
+  Serial.println("[INIT] Mutexes created (with priority inheritance)");
   
   // Create Binary Semaphore
-  // Untuk ISR -> Task communication (deferred interrupt processing)
   emergencySemaphore = xSemaphoreCreateBinary();
-  if (emergencySemaphore == NULL) {
-    Serial.println("[ERROR] Failed to create binary semaphore!");
+  if (!emergencySemaphore) {
+    Serial.println("[ERROR] Failed to create semaphore!");
     while(1);
   }
-  Serial.println("[INIT] Emergency binary semaphore created");
+  Serial.println("[INIT] Binary semaphore created");
   
-  // Attach Interrupt untuk Emergency Button
-  attachInterrupt(digitalPinToInterrupt(EMERGENCY_BTN), emergencyButtonISR, FALLING);
-  Serial.println("[INIT] Emergency button interrupt attached (FALLING edge)");
+  Serial.println("\n[INIT] Creating tasks...");
   
-  Serial.println("\n[INIT] Creating tasks with priorities...");
+  // Emergency Task (Priority 4 - Highest)
+  xTaskCreate(EmergencyHandlerTask, "Emergency", 4096, NULL, 4, &emergencyTaskHandle);
   
-  // Create Tasks dengan priority berbeda
-  // Priority tinggi = angka lebih besar
-  // Stack size: 2048 words (8KB) per task
+  // Lift Control Task (Priority 3)
+  xTaskCreate(LiftControlTask, "LiftControl", 4096, NULL, 3, &liftControlTaskHandle);
   
-  // Task 1: Emergency Handler (Priority 4 - HIGHEST)
-  xTaskCreate(
-    EmergencyHandlerTask,
-    "EmergencyHandler",
-    2048,
-    NULL,
-    4,  // Prioritas tertinggi
-    &emergencyTaskHandle
-  );
+  // Door Control Task (Priority 2)
+  xTaskCreate(DoorControlTask, "DoorControl", 4096, NULL, 2, &doorTaskHandle);
   
-  // Task 2: Elevator Control (Priority 3 - HIGH)
-  xTaskCreate(
-    ElevatorControlTask,
-    "ElevatorControl",
-    2048,
-    NULL,
-    3,  // Prioritas tinggi
-    &elevatorControlTaskHandle
-  );
+  // Request Handler Task (Priority 1)
+  xTaskCreate(RequestHandlerTask, "RequestHandler", 4096, NULL, 1, &requestHandlerTaskHandle);
   
-  // Task 3: Door Control (Priority 2 - MEDIUM)
-  xTaskCreate(
-    DoorControlTask,
-    "DoorControl",
-    2048,
-    NULL,
-    2,  // Prioritas sedang
-    &doorControlTaskHandle
-  );
-  
-  // Task 4: Request Handler (Priority 1 - MEDIUM-LOW)
-  xTaskCreate(
-    RequestHandlerTask,
-    "RequestHandler",
-    2048,
-    NULL,
-    1,  // Prioritas sedang-rendah
-    &requestHandlerTaskHandle
-  );
-  
-  // Task 5: Display Logger (Priority 0 - LOWEST)
-  xTaskCreate(
-    DisplayLoggerTask,
-    "DisplayLogger",
-    2048,
-    NULL,
-    0,  // Prioritas terendah
-    &displayLoggerTaskHandle
-  );
+  // LCD Display Task (Priority 0 - Lowest)
+  xTaskCreate(LCDDisplayTask, "LCDDisplay", 4096, NULL, 0, &lcdDisplayTaskHandle);
   
   Serial.println("[INIT] All tasks created successfully!");
-  Serial.println("\n========================================");
-  Serial.println("[SYSTEM] Elevator starting at Floor 1");
-  Serial.println("[SYSTEM] Door CLOSED - Ready for requests");
-  Serial.println("========================================");
-  Serial.println("[INFO] Press floor buttons (1-5) to request elevator");
-  Serial.println("[INFO] Press emergency button to trigger emergency stop");
-  Serial.println("[INFO] Press door obstacle button to simulate obstacle");
-  Serial.println("========================================\n");
-  
-  // Scheduler akan dijalankan otomatis oleh Arduino framework
-  // vTaskStartScheduler() tidak diperlukan di Arduino ESP32
+  Serial.println("\n╔═══════════════════════════════════════════════╗");
+  Serial.println("║  SYSTEM READY - Lift at Floor 1              ║");
+  Serial.println("║  Use buttons to control the lift             ║");
+  Serial.println("║  Status displayed on LCD1602                  ║");
+  Serial.println("╚═══════════════════════════════════════════════╝\n");
 }
 
 void loop() {
-  // Loop kosong - semua logic ada di FreeRTOS tasks
-  // Arduino loop() tetap berjalan tapi tidak digunakan
+  // Empty - all logic in FreeRTOS tasks
   vTaskDelay(pdMS_TO_TICKS(1000));
 }

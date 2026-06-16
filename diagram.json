@@ -1,138 +1,46 @@
 {
   "version": 1,
-  "author": "Elevator Control System FreeRTOS",
+  "author": "Single Lift Control System FreeRTOS with LCD",
   "editor": "wokwi",
   "parts": [
     { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 0, "left": 0, "attrs": {} },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btn1",
-      "top": 0,
-      "left": -200,
-      "attrs": { "color": "green" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btn2",
-      "top": 40,
-      "left": -200,
-      "attrs": { "color": "green" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btn3",
-      "top": 80,
-      "left": -200,
-      "attrs": { "color": "green" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btn4",
-      "top": 120,
-      "left": -200,
-      "attrs": { "color": "green" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btn5",
-      "top": 160,
-      "left": -200,
-      "attrs": { "color": "green" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btnEmergency",
-      "top": 220,
-      "left": -200,
-      "attrs": { "color": "red" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btnObstacle",
-      "top": 380.6,
-      "left": -201.6,
-      "attrs": { "color": "yellow" }
-    },
-    { "type": "wokwi-led", "id": "ledUp", "top": 102, "left": 503, "attrs": { "color": "blue" } },
-    {
-      "type": "wokwi-led",
-      "id": "ledDown",
-      "top": 102,
-      "left": 416.6,
-      "attrs": { "color": "cyan" }
-    },
-    {
-      "type": "wokwi-led",
-      "id": "ledDoor",
-      "top": 102,
-      "left": 320.6,
-      "attrs": { "color": "green" }
-    },
-    {
-      "type": "wokwi-led",
-      "id": "ledEmergency",
-      "top": 102,
-      "left": 224.6,
-      "attrs": { "color": "red" }
-    },
-    {
-      "type": "wokwi-resistor",
-      "id": "r1",
-      "top": 23.15,
-      "left": 153.6,
-      "attrs": { "value": "220" }
-    },
-    {
-      "type": "wokwi-resistor",
-      "id": "r2",
-      "top": 51.95,
-      "left": 153.6,
-      "attrs": { "value": "220" }
-    },
-    {
-      "type": "wokwi-resistor",
-      "id": "r3",
-      "top": 80.75,
-      "left": 153.6,
-      "attrs": { "value": "220" }
-    },
-    {
-      "type": "wokwi-resistor",
-      "id": "r4",
-      "top": 109.55,
-      "left": 153.6,
-      "attrs": { "value": "220" }
-    }
+    
+    { "type": "wokwi-pushbutton", "id": "btn1", "top": -80, "left": -350, "attrs": { "color": "blue", "label": "Floor 1" } },
+    { "type": "wokwi-pushbutton", "id": "btn2", "top": -40, "left": -350, "attrs": { "color": "blue", "label": "Floor 2" } },
+    { "type": "wokwi-pushbutton", "id": "btn3", "top": 0, "left": -350, "attrs": { "color": "blue", "label": "Floor 3" } },
+    { "type": "wokwi-pushbutton", "id": "btn4", "top": 40, "left": -350, "attrs": { "color": "blue", "label": "Floor 4" } },
+    { "type": "wokwi-pushbutton", "id": "btn5", "top": 80, "left": -350, "attrs": { "color": "blue", "label": "Floor 5" } },
+    { "type": "wokwi-pushbutton", "id": "btnEmg", "top": 120, "left": -350, "attrs": { "color": "red", "label": "EMERGENCY" } },
+    { "type": "wokwi-pushbutton", "id": "btnOpen", "top": 160, "left": -350, "attrs": { "color": "green", "label": "OPEN" } },
+    { "type": "wokwi-pushbutton", "id": "btnClose", "top": 200, "left": -350, "attrs": { "color": "yellow", "label": "CLOSE" } },
+    
+    { "type": "wokwi-lcd1602", "id": "lcd", "top": 250, "left": 200, "attrs": { "pins": "i2c" } }
   ],
   "connections": [
     [ "esp:TX0", "$serialMonitor:RX", "", [] ],
     [ "esp:RX0", "$serialMonitor:TX", "", [] ],
-    [ "btn1:2.l", "esp:GND.1", "black", [ "h-164.8", "v544", "h466.1" ] ],
-    [ "btn1:2.r", "esp:D13", "green", [ "h0" ] ],
-    [ "btn2:2.l", "esp:GND.1", "black", [ "h-145.6", "v484.8", "h446.9" ] ],
-    [ "btn2:2.r", "esp:D12", "green", [ "h0" ] ],
-    [ "btn3:2.l", "esp:GND.1", "black", [ "h-126.4", "v425.6", "h427.7" ] ],
-    [ "btn3:2.r", "esp:D14", "green", [ "h0" ] ],
-    [ "btn4:2.l", "esp:GND.1", "black", [ "h-107.2", "v366.4", "h408.5" ] ],
-    [ "btn4:2.r", "esp:D27", "green", [ "h0" ] ],
-    [ "btn5:2.l", "esp:GND.1", "black", [ "h-88", "v307.2", "h389.3" ] ],
-    [ "btn5:2.r", "esp:D26", "green", [ "h0" ] ],
-    [ "btnEmergency:2.l", "esp:GND.1", "black", [ "h-68.8", "v228", "h370.1" ] ],
-    [ "btnEmergency:2.r", "esp:D25", "red", [ "h0" ] ],
-    [ "btnObstacle:2.l", "esp:GND.1", "black", [ "h-48", "v48.2", "h350.9" ] ],
-    [ "btnObstacle:2.r", "esp:D33", "yellow", [ "h0" ] ],
-    [ "esp:D19", "r1:1", "blue", [ "h42.7", "v-43.4", "h9.6" ] ],
-    [ "r1:2", "ledUp:A", "blue", [ "h357.2", "v167.15", "h-48" ] ],
-    [ "ledUp:C", "esp:GND.1", "black", [ "v48", "h0.4", "v28.8", "h-417.1" ] ],
-    [ "esp:D18", "r2:1", "cyan", [ "h0" ] ],
-    [ "r2:2", "ledDown:A", "cyan", [ "h258", "v115.2", "h-28.8" ] ],
-    [ "ledDown:C", "esp:GND.1", "black", [ "v76.8", "h134.8", "h-465.1" ] ],
-    [ "esp:D5", "r3:1", "green", [ "h0" ] ],
-    [ "r3:2", "ledDoor:A", "green", [ "h50", "v0.75", "h124.8", "v86.4", "h-19.2" ] ],
-    [ "ledDoor:C", "esp:GND.1", "black", [ "v76.8", "h-234.3" ] ],
-    [ "esp:D17", "r4:1", "red", [ "h0" ] ],
-    [ "r4:2", "ledEmergency:A", "red", [ "v-19.2", "h75.6", "v76.8", "h-38.4" ] ],
-    [ "ledEmergency:C", "esp:GND.1", "black", [ "v76.8", "h-138.3" ] ]
+    
+    [ "btn1:1.r", "esp:D13", "blue", [ "h0" ] ],
+    [ "btn1:2.r", "esp:GND.1", "black", [ "h0" ] ],
+    [ "btn2:1.r", "esp:D12", "blue", [ "h0" ] ],
+    [ "btn2:2.r", "esp:GND.1", "black", [ "h0" ] ],
+    [ "btn3:1.r", "esp:D14", "blue", [ "h0" ] ],
+    [ "btn3:2.r", "esp:GND.1", "black", [ "h0" ] ],
+    [ "btn4:1.r", "esp:D27", "blue", [ "h0" ] ],
+    [ "btn4:2.r", "esp:GND.1", "black", [ "h0" ] ],
+    [ "btn5:1.r", "esp:D26", "blue", [ "h0" ] ],
+    [ "btn5:2.r", "esp:GND.1", "black", [ "h0" ] ],
+    [ "btnEmg:1.r", "esp:D25", "red", [ "h0" ] ],
+    [ "btnEmg:2.r", "esp:GND.1", "black", [ "h0" ] ],
+    [ "btnOpen:1.r", "esp:D33", "green", [ "h0" ] ],
+    [ "btnOpen:2.r", "esp:GND.1", "black", [ "h0" ] ],
+    [ "btnClose:1.r", "esp:D32", "yellow", [ "h0" ] ],
+    [ "btnClose:2.r", "esp:GND.1", "black", [ "h0" ] ],
+    
+    [ "lcd:GND", "esp:GND.1", "black", [ "h0" ] ],
+    [ "lcd:VCC", "esp:3V3", "red", [ "h0" ] ],
+    [ "lcd:SDA", "esp:D21", "green", [ "h0" ] ],
+    [ "lcd:SCL", "esp:D22", "blue", [ "h0" ] ]
   ],
   "dependencies": {}
 }
