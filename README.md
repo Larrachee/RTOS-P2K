@@ -5,11 +5,10 @@
 Sistem kontrol lift 5 lantai berbasis FreeRTOS yang disimulasikan menggunakan ESP32 di Wokwi simulator. Project ini mendemonstrasikan konsep-konsep penting dalam Real-Time Operating System:
 
 - **Priority-based preemptive scheduling**
-- **Inter-task communication** (Queue, Mutex, Semaphore)
-- **Interrupt Service Routine (ISR)** dengan deferred processing
-- **Synchronization mechanisms** untuk mencegah race condition
+- **Synchronization mechanisms** (Mutex, Binary Semaphore)
+- **State machine** untuk kontrol lift dan pintu
 - **Priority inheritance** untuk menghindari priority inversion
-- **Stack monitoring** untuk analisis penggunaan memori
+- **Elevator SCAN scheduling** untuk penjadwalan request lantai
 - **Fault-tolerant emergency handling**
 
 ## Arsitektur Sistem
@@ -18,228 +17,135 @@ Sistem kontrol lift 5 lantai berbasis FreeRTOS yang disimulasikan menggunakan ES
 
 | Task | Priority | Fungsi | Scheduling |
 |------|----------|--------|------------|
-| **EmergencyHandlerTask** | 4 (Highest) | Menangani emergency stop dengan deferred interrupt processing | Event-driven (wait on semaphore) |
-| **ElevatorControlTask** | 3 (High) | Mengontrol pergerakan lift antar lantai | Periodic (1 detik) |
-| **DoorControlTask** | 2 (Medium) | Mengontrol buka/tutup pintu dengan obstacle detection | Periodic (500ms) |
-| **RequestHandlerTask** | 1 (Medium-Low) | Membaca input tombol dan menambahkan request ke queue | Periodic (100ms) |
-| **DisplayLoggerTask** | 0 (Lowest) | Menampilkan status sistem dan monitoring stack | Periodic (5 detik) |
+| **EmergencyHandlerTask** | 4 (Highest) | Menangani emergency stop | Event-driven (wait on semaphore) |
+| **LiftControlTask** | 3 (High) | Mengontrol pergerakan lift dengan SCAN scheduling | Periodic (1 detik) |
+| **DoorControlTask** | 2 (Medium) | Mengontrol buka/tutup pintu (departure & arrival) | Periodic (500ms) |
+| **RequestHandlerTask** | 1 (Medium-Low) | Membaca input tombol fisik | Periodic (50ms) |
+| **LCDDisplayTask** | 0 (Lowest) | Menampilkan status real-time di LCD1602 | Periodic (500ms) |
 
-### Virtual Peripheral
+### Tombol Fisik (Input)
 
-#### Input (Push Buttons)
-- **Floor 1-5 Buttons** (GPIO 13, 12, 14, 27, 26): Request lantai tujuan
-- **Emergency Button** (GPIO 25): Trigger emergency stop (dengan interrupt)
-- **Door Obstacle Button** (GPIO 33): Simulasi obstacle di pintu
+| Tombol | GPIO | Fungsi |
+|--------|------|--------|
+| **Floor 1** | 13 | Request lantai 1 |
+| **Floor 2** | 12 | Request lantai 2 |
+| **Floor 3** | 14 | Request lantai 3 |
+| **Floor 4** | 27 | Request lantai 4 |
+| **Floor 5** | 26 | Request lantai 5 |
+| **Emergency** | 25 | Trigger emergency stop |
+| **Open Door** | 33 | Buka pintu manual |
+| **Close Door** | 32 | Tutup pintu manual |
 
-#### Output (LED Indicators)
-- **LED UP** (GPIO 19): Indikator lift naik
-- **LED DOWN** (GPIO 18): Indikator lift turun
-- **LED DOOR** (GPIO 5): Indikator pintu terbuka
-- **LED EMERGENCY** (GPIO 17): Indikator mode emergency
+### Output
 
+- **LCD1602 I2C** (SDA: GPIO 21, SCL: GPIO 22)
+  - Baris atas: `Floor: X>Y UP/DOWN/IDLE`
+  - Baris bawah: `Door:X  Req:N`
 
 ## Mekanisme FreeRTOS
 
-### 1. Queue (Floor Request Queue)
+### 1. Mutex (Lift State Mutex)
 
 ```c
-QueueHandle_t floorRequestQueue;
-floorRequestQueue = xQueueCreate(10, sizeof(int));
-```
-
-- **Fungsi**: Menyimpan request lantai dari user
-- **Ukuran**: 10 items (setiap item adalah integer)
-- **Producer**: RequestHandlerTask
-- **Consumer**: ElevatorControlTask
-- **Mode**: Non-blocking dengan timeout
-
-### 2. Mutex (Elevator State Mutex)
-
-```c
-SemaphoreHandle_t elevatorStateMutex;
-elevatorStateMutex = xSemaphoreCreateMutex();
+liftStateMutex = xSemaphoreCreateMutex();
 ```
 
 - **Fungsi**: Melindungi shared state dari race condition
 - **Protected Variables**:
-  - currentFloor
-  - targetFloor
-  - elevatorDirection
-  - doorState
-  - emergencyMode
-  - doorObstacle
+  - `currentFloor`
+  - `targetFloor`
+  - `direction`
+  - `doorState`
+  - `emergencyMode`
+  - `manualDoorOpen`, `manualDoorClose`
+  - `needsDepartureDoor`, `needsArrivalDoor`
+  - `floorRequested[]`, `floorRequestOrder[]`
 - **Feature**: Priority Inheritance (mencegah priority inversion)
 - **Timeout**: Semua acquire menggunakan timeout 100ms untuk keamanan
 
-### 3. Binary Semaphore (Emergency Semaphore)
+### 2. Binary Semaphore (Emergency Semaphore)
 
 ```c
-SemaphoreHandle_t emergencySemaphore;
 emergencySemaphore = xSemaphoreCreateBinary();
 ```
 
-- **Fungsi**: ISR-to-Task communication untuk emergency handling
-- **Given by**: ISR (emergencyButtonISR)
+- **Fungsi**: Task-to-task communication untuk emergency handling
+- **Given by**: RequestHandlerTask (saat tombol emergency ditekan)
 - **Taken by**: EmergencyHandlerTask
-- **Pattern**: Deferred Interrupt Processing
+- **Pattern**: Event-driven deferred processing
 
+## Algoritma SCAN Scheduling
 
-## Alur ISR dan Deferred Processing
+Sistem tidak menggunakan queue FIFO murni, melainkan algoritma elevator SCAN:
 
-### Emergency Button Flow
+1. **Saat idle**: lift memilih request lantai **terdekat** dari posisi saat ini
+2. **Jika ada tie** (jarak sama): dipilih berdasarkan urutan request pertama (FIFO tie-break)
+3. **Selama bergerak satu arah**: lift berhenti di setiap lantai yang direquest di jalur tersebut
+4. **Hanya balik arah** setelah melayani request terakhir di arah tersebut
 
-1. **User menekan emergency button** → Hardware interrupt triggered
-2. **ISR (emergencyButtonISR)** dijalankan:
-   ```c
-   void IRAM_ATTR emergencyButtonISR() {
-     emergencyButtonPressed = true;
-     xSemaphoreGiveFromISR(emergencySemaphore, &xHigherPriorityTaskWoken);
-     portYIELD_FROM_ISR();
-   }
-   ```
-   - ISR **TIDAK** melakukan processing berat
-   - ISR hanya memberi semaphore
-   - ISR sangat singkat dan cepat (< 10 instruksi)
+### Contoh Alur
 
-3. **EmergencyHandlerTask terbangun** (prioritas tertinggi):
-   ```c
-   xSemaphoreTake(emergencySemaphore, portMAX_DELAY);
-   // Lakukan processing berat di sini:
-   // - Stop lift
-   // - Buka pintu
-   // - Clear queue
-   // - Update LED
-   ```
-   - Processing berat dilakukan di task context (bukan ISR)
-   - Aman menggunakan mutex, delay, printf, dll.
+**Contoh 1 — Dari Lantai 2, request Lantai 5 lalu Lantai 4:**
+Kedua request ke arah **ATAS**, maka yang terdekat dilayani dulu:
+```
+Lantai 2 → buka pintu (departure) → tutup → Lantai 3 → Lantai 4 (buka/tutup) → Lantai 5 (buka/tutup)
+```
 
-**Keuntungan Deferred Processing:**
-- ISR tetap singkat → interrupt latency rendah
-- Processing kompleks dilakukan di task → bisa preempted jika ada interrupt lain
-- Lebih fleksibel dan aman
+**Contoh 2 — Dari Lantai 3, request Lantai 5 lalu Lantai 1:**
+Request pertama ke arah **ATAS**, lift naik dulu, lalu turun:
+```
+Lantai 3 → buka pintu (departure) → tutup → Lantai 4 → Lantai 5 (buka/tutup) → Lantai 4 → Lantai 3 → Lantai 2 → Lantai 1 (buka/tutup)
+```
 
+## Alur Kerja Lift
 
-## Strategi Scheduling
+### Sequence Normal (Request Baru)
 
-### Preemptive Priority-Based Scheduling
+1. User menekan tombol lantai → `floorRequested[floor] = true`
+2. `LiftControlTask` (saat idle) memilih target terdekat
+3. `DoorControlTask` membuka dan menutup pintu di lantai asal (**departure door**)
+4. `LiftControlTask` menggerakkan lift satu lantai per detik
+5. Saat tiba di lantai tujuan, `DoorControlTask` membuka dan menutup pintu (**arrival door**)
+6. Jika masih ada request, lift melanjutkan perjalanan
 
-FreeRTOS menggunakan **preemptive priority-based scheduling**:
+### Emergency Flow
 
-1. **Task prioritas tinggi selalu berjalan duluan**
-   - EmergencyHandlerTask (P4) akan preempt task lain saat emergency terjadi
-   - ElevatorControlTask (P3) mengontrol lift dengan prioritas tinggi
-
-2. **Periodic Tasks menggunakan vTaskDelayUntil()**
-   ```c
-   TickType_t xLastWakeTime = xTaskGetTickCount();
-   while(1) {
-     // Do work
-     vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
-   }
-   ```
-   - Menjamin periode yang konsisten
-   - Task masuk BLOCKED state saat delay → CPU diberikan ke task lain
-
-3. **Critical Section dijaga singkat**
-   - Mutex hanya di-hold saat akses shared data
-   - Immediately release setelah selesai
-   - Minimize blocking time
-
-4. **Event-driven Task (EmergencyHandlerTask)**
-   - Wait pada semaphore (BLOCKED state)
-   - Terbangun hanya saat emergency terjadi
-   - Tidak membuang CPU cycle
-
+1. User menekan tombol Emergency
+2. `RequestHandlerTask` memberi `emergencySemaphore`
+3. `EmergencyHandlerTask` (prioritas tertinggi) terbangun:
+   - Set `emergencyMode = true`
+   - Buka pintu
+   - Hapus semua request
+   - Tunggu 5 detik
+   - Clear emergency mode
 
 ## Analisis Race Condition, Priority Inversion, dan Deadlock
 
 ### 1. Race Condition Prevention
 
-**Masalah Potensial:**
-- Banyak task mengakses `elevatorState` secara concurrent
-- Tanpa proteksi → race condition → data corruption
+Semua akses ke shared state `lift` dilakukan melalui `liftStateMutex` dengan timeout:
 
-**Solusi:**
 ```c
-// Task A
-xSemaphoreTake(elevatorStateMutex, timeout);
-elevatorState.currentFloor = 3;  // Critical section
-xSemaphoreGive(elevatorStateMutex);
-
-// Task B (concurrent)
-xSemaphoreTake(elevatorStateMutex, timeout);
-int floor = elevatorState.currentFloor;  // Terlindungi
-xSemaphoreGive(elevatorStateMutex);
+if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  // Critical section
+  lift.currentFloor = ...;
+  xSemaphoreGive(liftStateMutex);
+}
 ```
-
-**Strategi:**
-- Semua akses ke shared state harus acquire mutex dulu
-- Critical section dijaga singkat
-- Timeout digunakan untuk menghindari hang forever
 
 ### 2. Priority Inversion Prevention
 
-**Masalah:**
-```
-TaskHigh (P3) butuh mutex
-  ↓ blocked karena...
-TaskLow (P1) hold mutex
-  ↓ tapi preempted oleh...
-TaskMedium (P2) → TaskHigh terpaksa nunggu TaskMedium selesai!
-```
-
-**Solusi: Priority Inheritance**
+Mutex dibuat dengan priority inheritance secara otomatis:
 ```c
-elevatorStateMutex = xSemaphoreCreateMutex();  // Auto priority inheritance
+liftStateMutex = xSemaphoreCreateMutex();
 ```
-
-- Saat TaskLow hold mutex yang dibutuhkan TaskHigh
-- TaskLow **sementara dinaikkan prioritasnya** = priority TaskHigh
-- TaskLow cepat selesai → release mutex → TaskHigh bisa jalan
-- TaskLow kembali ke priority aslinya
-
-**Di project ini:**
-- ElevatorControlTask (P3) sering butuh mutex
-- RequestHandlerTask (P1) juga akses mutex
-- Tanpa priority inheritance → RequestHandlerTask bisa block ElevatorControlTask
-- Dengan priority inheritance → masalah teratasi
-
 
 ### 3. Deadlock Prevention
 
-**Masalah Potensial:**
-```
-Task A: Lock mutex1 → tunggu mutex2
-Task B: Lock mutex2 → tunggu mutex1
-→ Deadlock! Keduanya saling tunggu forever
-```
-
-**Strategi Prevention dalam project:**
-
-1. **Hanya menggunakan 1 mutex** (elevatorStateMutex)
-   - Tidak ada nested mutex
-   - Tidak mungkin circular wait
-
-2. **Timeout pada semua acquire**
-   ```c
-   if (xSemaphoreTake(elevatorStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-     // Critical section
-     xSemaphoreGive(elevatorStateMutex);
-   } else {
-     // Timeout - handle error
-   }
-   ```
-   - Jika deadlock terjadi, task tidak hang forever
-   - Task bisa retry atau log error
-
-3. **Urutan resource acquisition yang konsisten**
-   - Semua task acquire mutex dengan cara yang sama
-   - Tidak ada nested locking
-
-4. **Short critical sections**
-   - Minimize waktu hold mutex
-   - Kurangi kemungkinan contention
-
+- Hanya menggunakan **1 mutex** (`liftStateMutex`)
+- Tidak ada nested mutex
+- Semua blocking call menggunakan timeout
+- Critical section dijaga singkat
 
 ## Cara Menjalankan di Wokwi
 
@@ -251,12 +157,12 @@ Task B: Lock mutex2 → tunggu mutex1
 
 2. **Create New Project**
    - Pilih "ESP32" template
-   - Atau gunakan "New Arduino Project"
 
 3. **Upload File**
    - Copy isi `sketch.ino` ke editor code
    - Copy isi `diagram.json` ke tab diagram.json
-   
+   - Pastikan file tetap bernama `sketch.ino` (bukan `.c` atau `.cpp`)
+
 4. **Start Simulation**
    - Klik tombol hijau "Start Simulation"
    - Buka Serial Monitor (ikon terminal di bawah)
@@ -264,85 +170,60 @@ Task B: Lock mutex2 → tunggu mutex1
 5. **Interaksi:**
    - **Tekan tombol Floor 1-5**: Request lift ke lantai tersebut
    - **Tekan tombol Emergency**: Trigger emergency stop
-   - **Tekan tombol Door Obstacle**: Simulasi obstacle menghalangi pintu
-   - **Monitor Serial**: Lihat log real-time dari sistem
+   - **Tekan tombol Open/Close**: Kontrol pintu manual
+   - **Monitor LCD**: Lihat status real-time lift
 
 ### Tips Simulasi:
 
 - **Test Normal Operation**: Tekan beberapa tombol lantai, amati lift bergerak
-- **Test Queue**: Tekan banyak tombol sekaligus, lihat request diproses berurutan
+- **Test SCAN Scheduling**: Dari Lantai 2, tekan Floor 5 lalu Floor 4 → lift akan berhenti di Floor 4 dulu
+- **Test Reverse**: Dari Lantai 3, tekan Floor 5 lalu Floor 1 → lift naik ke 5, lalu turun ke 1
 - **Test Emergency**: Tekan emergency saat lift bergerak, lihat immediate stop
-- **Test Door Obstacle**: Tekan obstacle saat pintu akan tutup, lihat pintu buka kembali
-- **Monitor Stack**: Perhatikan stack high water mark di log setiap 5 detik
-
+- **Test Manual Door**: Tekan Open/Close saat pintu sedang bergerak
 
 ## Contoh Serial Log
 
 ```
-=====================================
-  ELEVATOR CONTROL SYSTEM - FreeRTOS
-  5-Floor Simulation with Wokwi
-=====================================
+╔═══════════════════════════════════════════════╗
+║    LIFT CONTROL SYSTEM - FreeRTOS             ║
+║    1 Lift × 5 Floors with LCD Display        ║
+╚═══════════════════════════════════════════════╝
 
+[INIT] LCD initialized
 [INIT] GPIO initialized
-[INIT] Floor request queue created (size: 10)
-[INIT] Elevator state mutex created (with priority inheritance)
-[INIT] Emergency binary semaphore created
-[INIT] Emergency button interrupt attached (FALLING edge)
+[INIT] Mutexes created (with priority inheritance)
+[INIT] Binary semaphore created
 
-[INIT] Creating tasks with priorities...
-[INIT] All tasks created successfully!
+[INIT] Creating tasks...
+[TASK] EmergencyHandlerTask started - Priority: 4
+[TASK] LiftControlTask started - Priority: 3
+[TASK] DoorControlTask started - Priority: 2
+[TASK] RequestHandlerTask started - Priority: 1
+[TASK] LCDDisplayTask started - Priority: 0
 
-[SYSTEM] Elevator starting at Floor 1
-[SYSTEM] Press floor buttons (1-5) to request elevator
-[SYSTEM] Press emergency button to trigger emergency stop
-[SYSTEM] Press door obstacle button to simulate obstacle
+╔═══════════════════════════════════════════════╗
+║  SYSTEM READY - Lift at Floor 1              ║
+║  Use buttons to control the lift             ║
+║  Status displayed on LCD1602                  ║
+╚═══════════════════════════════════════════════╝
 
-[TASK] EmergencyHandlerTask started - Priority: 4 (HIGHEST)
-[TASK] ElevatorControlTask started - Priority: 3 (HIGH)
-[TASK] DoorControlTask started - Priority: 2 (MEDIUM)
-[TASK] RequestHandlerTask started - Priority: 1 (MEDIUM-LOW)
-[TASK] DisplayLoggerTask started - Priority: 0 (LOWEST)
+[BUTTON] Floor 5 pressed
+[LIFT] New request: Floor 5
+[DOOR] Opening (departure)...
+[DOOR] Opened
+[DOOR] Closing...
+[DOOR] Closed
 
-[REQUEST] Floor 3 button pressed - Added to queue
-[ELEVATOR] New request received: Floor 3
-[ELEVATOR] Moving UP: Floor 1 -> 2
-[ELEVATOR] Moving UP: Floor 2 -> 3
-[ELEVATOR] Arrived at Floor 3
-[DOOR] Opening door...
-[DOOR] Door opened
-[DOOR] Closing door...
-[DOOR] Door closed
-
-========== SYSTEM STATUS ==========
-Current Floor: 3
-Target Floor: 3
-Direction: IDLE
-Door State: CLOSED
-Emergency Mode: Normal
-Door Obstacle: Clear
-Queue Status: 0 requests waiting, 10 spaces available
-
---- Stack Monitoring (High Water Mark) ---
-EmergencyHandlerTask: 1654 words remaining
-ElevatorControlTask: 1432 words remaining
-DoorControlTask: 1398 words remaining
-RequestHandlerTask: 1512 words remaining
-DisplayLoggerTask: 1287 words remaining
-Free Heap: 245632 bytes
-===================================
-
-[REQUEST] Floor 5 button pressed - Added to queue
-[ELEVATOR] New request received: Floor 5
-[ELEVATOR] Moving UP: Floor 3 -> 4
-[ELEVATOR] Moving UP: Floor 4 -> 5
-
-[EMERGENCY] *** EMERGENCY BUTTON PRESSED! ***
-[EMERGENCY] Lift stopped, door opened, queue cleared
-[EMERGENCY] Press emergency button again to reset
-[EMERGENCY] Emergency mode cleared. System normal.
+[LIFT] Moving UP: Floor 1 -> 2
+[LIFT] Moving UP: Floor 2 -> 3
+[LIFT] Moving UP: Floor 3 -> 4
+[LIFT] Moving UP: Floor 4 -> 5
+[LIFT] Arrived at Floor 5
+[DOOR] Opening (arrival)...
+[DOOR] Opened
+[DOOR] Closing...
+[DOOR] Closed
 ```
-
 
 ## Fitur-Fitur RTOS yang Didemonstrasikan
 
@@ -351,45 +232,34 @@ Free Heap: 245632 bytes
 - Priority-based scheduling (0-4)
 - Periodic dan event-driven tasks
 
-### ✅ Inter-Task Communication
-- **Queue**: Request lantai dari user ke elevator control
-- **Mutex**: Proteksi shared elevator state
-- **Binary Semaphore**: ISR to task notification
-
 ### ✅ Synchronization
 - Mutex dengan priority inheritance
+- Binary semaphore untuk emergency
 - Timeout mechanism untuk safety
-- Critical section management
 
-### ✅ Interrupt Handling
-- Hardware interrupt pada emergency button
-- ISR singkat dan cepat (< 10 instruksi)
-- Deferred interrupt processing
-
-### ✅ Memory Management
-- Stack monitoring (high water mark)
-- Heap monitoring
-- Stack size allocation per task
+### ✅ State Machine
+- State lift: IDLE, MOVING_UP, MOVING_DOWN
+- State pintu: CLOSED, OPENING, OPEN, CLOSING
+- Departure dan arrival door cycles
 
 ### ✅ Scheduling Analysis
+- Elevator SCAN scheduling
+- Direction-aware request handling
 - Preemptive scheduling demonstration
-- Priority inversion handling
-- CPU utilization optimization
 
 ### ✅ Fault Tolerance
 - Emergency stop mechanism
 - Timeout pada semua blocking operation
-- Graceful degradation
-
+- Manual door override
 
 ## Struktur Kode
 
 ```
-ElevatorSimulation2/
+RTOS-P2K/
 ├── sketch.ino           # Main code dengan semua task implementation
 ├── diagram.json         # Wokwi circuit diagram
-├── README.md           # Dokumentasi project (file ini)
-└── penjelasan_task.md  # Penjelasan detail setiap task
+├── libraries.txt        # Daftar library Wokwi
+└── README.md            # Dokumentasi project (file ini)
 ```
 
 ## Requirements
@@ -403,17 +273,17 @@ ElevatorSimulation2/
 
 1. **Real-Time Scheduling**: Priority-based preemptive scheduling
 2. **Concurrency**: Multiple tasks running "simultaneously"
-3. **Synchronization**: Mutex, semaphore, queue
+3. **Synchronization**: Mutex, semaphore
 4. **Critical Section**: Protected shared resource access
-5. **Interrupt Handling**: ISR dan deferred processing
-6. **Memory Management**: Stack allocation dan monitoring
+5. **State Machine**: Lift dan door state management
+6. **Elevator Algorithm**: SCAN scheduling untuk optimasi perjalanan lift
 7. **Priority Inversion**: Penyebab dan solusinya
 8. **Deadlock**: Prevention strategies
 9. **Race Condition**: Detection dan prevention
 
 ## Author
 
-Elevator Control System FreeRTOS Simulation  
+Lift Control System FreeRTOS Simulation  
 Educational Project untuk pembelajaran Real-Time Operating System
 
 ## License
