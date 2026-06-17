@@ -46,7 +46,6 @@ typedef struct {
   bool emergencyMode;
   bool manualDoorOpen;
   bool manualDoorClose;
-  bool needsDepartureDoor;   // true = door must open/close before moving to new floor
   bool needsArrivalDoor;     // true = door must open/close after arriving at target floor
   bool floorRequested[6];    // index 1-5, true if floor has pending request
   int floorRequestOrder[6];  // request sequence number for tie-breaking
@@ -57,7 +56,7 @@ typedef struct {
 LiftState lift = {
   1, 1, IDLE, DOOR_CLOSED,         // currentFloor, targetFloor, direction, doorState
   false, false, false,             // emergencyMode, manualDoorOpen, manualDoorClose
-  false, false,                    // needsDepartureDoor, needsArrivalDoor
+  false,                           // needsArrivalDoor
   {false, false, false, false, false, false},  // floorRequested[6]
   {0, 0, 0, 0, 0, 0},              // floorRequestOrder[6]
   0                                // requestCounter
@@ -89,7 +88,6 @@ void EmergencyHandlerTask(void *parameter) {
         lift.emergencyMode = true;
         lift.direction = IDLE;
         lift.doorState = DOOR_OPEN;
-        lift.needsDepartureDoor = false;
         lift.needsArrivalDoor = false;
         for (int f = 1; f <= 5; f++) {
           lift.floorRequested[f] = false;
@@ -176,14 +174,13 @@ void LiftControlTask(void *parameter) {
     int current, target;
     Direction dir;
     DoorState door;
-    bool needDep, needArr, emergency;
+    bool needArr, emergency;
     
     if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       current = lift.currentFloor;
       target = lift.targetFloor;
       dir = lift.direction;
       door = lift.doorState;
-      needDep = lift.needsDepartureDoor;
       needArr = lift.needsArrivalDoor;
       emergency = lift.emergencyMode;
       xSemaphoreGive(liftStateMutex);
@@ -193,7 +190,7 @@ void LiftControlTask(void *parameter) {
     }
     
     // Safety: don't move during emergency or while door is busy
-    if (emergency || door != DOOR_CLOSED || needDep || needArr) {
+    if (emergency || door != DOOR_CLOSED || needArr) {
       vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
       continue;
     }
@@ -217,7 +214,6 @@ void LiftControlTask(void *parameter) {
           if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             lift.targetFloor = newTarget;
             lift.direction = newDir;
-            lift.needsDepartureDoor = true;
             xSemaphoreGive(liftStateMutex);
           }
           Serial.printf("[LIFT] New request: Floor %d\n", newTarget);
@@ -298,7 +294,6 @@ void DoorControlTask(void *parameter) {
   while (1) {
     bool shouldOpenDoor = false;
     bool manualOpen = false, manualClose = false;
-    bool wasDepartureDoor = false;
     bool wasArrivalDoor = false;
     
     if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -307,17 +302,10 @@ void DoorControlTask(void *parameter) {
       lift.manualDoorOpen = false;
       lift.manualDoorClose = false;
       
-      // Departure door: new request received, open door before moving
-      if (lift.needsDepartureDoor &&
+      // Arrival door: lift arrived at target floor
+      if (lift.needsArrivalDoor &&
           lift.doorState == DOOR_CLOSED &&
           !lift.emergencyMode) {
-        shouldOpenDoor = true;
-        wasDepartureDoor = true;
-      }
-      // Arrival door: lift arrived at target floor
-      else if (lift.needsArrivalDoor &&
-               lift.doorState == DOOR_CLOSED &&
-               !lift.emergencyMode) {
         shouldOpenDoor = true;
         wasArrivalDoor = true;
       }
@@ -357,9 +345,7 @@ void DoorControlTask(void *parameter) {
     }
     
     if (shouldOpenDoor) {
-      if (wasDepartureDoor) {
-        Serial.println("[DOOR] Opening (departure)...");
-      } else if (wasArrivalDoor) {
+      if (wasArrivalDoor) {
         Serial.println("[DOOR] Opening (arrival)...");
       } else {
         Serial.println("[DOOR] Opening...");
@@ -367,9 +353,6 @@ void DoorControlTask(void *parameter) {
       
       if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         lift.doorState = DOOR_OPENING;
-        if (wasDepartureDoor) {
-          lift.needsDepartureDoor = false;  // clear departure flag
-        }
         if (wasArrivalDoor) {
           lift.needsArrivalDoor = false;    // clear arrival flag
         }
@@ -540,34 +523,39 @@ void RequestHandlerTask(void *parameter) {
 /*
  * LCD Display Task
  * Priority: 0 (Lowest)
- * 
- * Format LCD 16x2:
- * Line 1: Floor & Direction
- * Line 2: Door & Queue Status
+ *
+ * Format LCD 16x2 (selalu tepat 16 karakter agar overwrite bersih):
+ * Line 1: "Floor:X>Y DDDDDD"  (D = arah, dipad ke 6 char)
+ * Line 2: "Door:C  Req:N   "
+ *
+ * Delta update: hanya tulis ulang baris yang berubah — tanpa lcd.clear()
  */
 void LCDDisplayTask(void *parameter) {
   Serial.println("[TASK] LCDDisplayTask started - Priority: 0");
   TickType_t xLastWakeTime = xTaskGetTickCount();
-  
+
+  // Cache state sebelumnya untuk perbandingan delta
+  char prevLine1[17] = "";
+  char prevLine2[17] = "";
+
   while (1) {
     if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       char line1[17] = {0};
       char line2[17] = {0};
-      
-      // Read Lift State
+
+      // Baca state lift
       int curr = 1, targ = 1;
       char door = 'C';
-      char emg = ' ';
+      bool isEmergency = false;
       const char* dirStr = "IDLE";
       int queueCount = 0;
-      
+
       if (xSemaphoreTake(liftStateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         curr = lift.currentFloor;
         targ = lift.targetFloor;
-        
-        // Direction as full word
+
         if (lift.emergencyMode) {
-          emg = '!';
+          isEmergency = true;
         } else if (lift.direction == MOVING_UP) {
           dirStr = "UP";
         } else if (lift.direction == MOVING_DOWN) {
@@ -575,43 +563,46 @@ void LCDDisplayTask(void *parameter) {
         } else {
           dirStr = "IDLE";
         }
-        
-        // Door
-        if (lift.doorState == DOOR_OPEN) door = 'O';
+
+        if      (lift.doorState == DOOR_OPEN)    door = 'O';
         else if (lift.doorState == DOOR_OPENING) door = 'o';
         else if (lift.doorState == DOOR_CLOSING) door = 'c';
-        else door = 'C';
-        
-        // Count pending requests
+        else                                     door = 'C';
+
         queueCount = 0;
         for (int f = 1; f <= 5; f++) {
           if (lift.floorRequested[f]) queueCount++;
         }
-        
+
         xSemaphoreGive(liftStateMutex);
       }
-      
-      // Format Line 1: Floor: 1>3 UP
-      if (emg == '!') {
-        snprintf(line1, 17, "Floor:%d>%d EMRG!", curr, targ);
+
+      // Format 16 karakter tepat agar overwrite bersih tanpa clear()
+      // Line 1: "Floor:X>Y DDDDDD" — dirStr dipad ke 6 char dengan %-6s
+      if (isEmergency) {
+        snprintf(line1, 17, "Floor:%d>%d EMRG! ", curr, targ);  // 16 char
       } else {
-        snprintf(line1, 17, "Floor:%d>%d %s", curr, targ, dirStr);
+        snprintf(line1, 17, "Floor:%d>%d %-6s", curr, targ, dirStr);  // 16 char
       }
-      
-      // Format Line 2: Door:O  Req:2
-      snprintf(line2, 17, "Door:%c  Req:%d   ", door, queueCount);
-      
-      // Update LCD
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print(line1);
-      lcd.setCursor(0, 1);
-      lcd.print(line2);
-      
+      // Line 2: "Door:C  Req:N   " — queueCount dipad ke 4 char dengan %-4d
+      snprintf(line2, 17, "Door:%c  Req:%-4d", door, queueCount);  // 16 char
+
+      // Delta update: hanya tulis baris yang isinya berbeda dari sebelumnya
+      if (strcmp(line1, prevLine1) != 0) {
+        lcd.setCursor(0, 0);
+        lcd.print(line1);
+        memcpy(prevLine1, line1, 17);
+      }
+      if (strcmp(line2, prevLine2) != 0) {
+        lcd.setCursor(0, 1);
+        lcd.print(line2);
+        memcpy(prevLine2, line2, 17);
+      }
+
       xSemaphoreGive(lcdMutex);
     }
-    
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
+
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(200));
   }
 }
 
